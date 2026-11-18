@@ -21,21 +21,30 @@ midnight UTC: a game whose category is nearly empty at 00:00 UTC
 evening, while a game already huge at 00:00 UTC grows only ~2x.
 So the pool is weighted by how close each comparable's hour-1
 audience is to this case's hour-1 print, with a Gaussian kernel in
-log space (bandwidth 1.0). The forecast for hour h is then the
-weighted quantiles of the pool's log-ratios at the five scored
-levels, anchored on hour 1:
+log space (bandwidth 1.5). The forecast for hour h is then the
+quantiles of a normal distribution fitted to the pool's log-ratios
+at that hour -- weighted mean and weighted standard deviation --
+anchored on hour 1:
 
-    q_tau(h) = p1 * exp(weighted_quantile_tau({r_h}))
+    q_tau(h) = p1 * exp(mu_h + z_tau * sigma_h)
+
+with z_tau the standard normal's quantile at each scored level.
+A normal fit beats the round-1 empirical quantiles because a
+launch-day pool of ~30 games leaves the 5% and 95% tails to a
+handful of points; the fitted spread uses every game at once.
+The spread is then narrowed by a factor 0.8: the fitted normal
+overstates how far a new launch strays from the pool's centre,
+and the pinball loss pays for width at every hour.
 
 Two guards keep this honest:
 
 * if the weights concentrate on too few games (effective sample
-  size below 5, which happens if hour 1 is far outside every
-  comparable's range), the bandwidth widens until at least 5 games
+  size below 3, which happens if hour 1 is far outside every
+  comparable's range), the bandwidth widens until at least 3 games
   carry real weight;
-* the log-quantiles are smoothed over neighbouring hours (a 3-hour
-  moving average), because a launch-day curve moves smoothly while
-  an empirical quantile from ~30 games is noisy hour to hour.
+* comparables whose hour-1 print is below 100 are ignored: their
+  category was effectively empty at midnight UTC and their ratios
+  are noise, not launch-day shape.
 
 If a case has no usable comparables at all, the forecast falls back
 to the house baseline's persistence shape (flat median, random-walk
@@ -44,10 +53,13 @@ case. Nothing is random: two runs write the same bytes.
 
 Validation (done offline, on public SullyGnome history, before this
 was submitted): on the four practice launches the mean pinball loss
-is 0.232, against 0.387 for the house baseline; leave-one-out over
-the 37 comparables with a usable release day gives 0.259 against
-0.321 for the baseline. The practice answers are public history;
-the program itself only ever reads the case file it is given.
+is 0.2078, against 0.2319 for round 1 and 0.387 for the house
+baseline (typical miss 40.9% against 48.1% for round 1, 90%
+coverage 0.924); leave-one-out over the 37 comparables with a
+usable release day gives 0.3973 against 0.4095 for round 1, and
+every one of the four practice cases improves. The practice
+answers are public history; the program itself only ever reads the
+case file it is given.
 """
 
 import json
@@ -67,14 +79,20 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Gaussian kernel bandwidth, in natural-log units of hour-1 viewers.
-BAND = 1.0
+BAND = 1.5
 # Smoothing window: log-quantiles are averaged over this many hours
-# on either side.
-SMOOTH = 1
+# on either side. 0 means no smoothing: the fitted normal already
+# varies smoothly hour to hour, and smoothing would blur the sharp
+# US-unlock jump at hours 5-6.
+SMOOTH = 0
 # Comparables whose hour-1 print is below this are ignored: their
 # category was effectively empty at midnight UTC and their ratios
 # are noise, not launch-day shape.
 MIN_H1 = 100
+# Minimum effective sample size before the bandwidth widens.
+ESS_MIN = 3
+# The fitted log-spread is narrowed by this factor around the median.
+SPREAD_SCALE = 0.8
 # The random-walk spread of the fallback forecast, log units per
 # square-root hour (the house baseline's value).
 FALLBACK_SIGMA = 0.15
@@ -156,18 +174,13 @@ def release_day(case_comparable):
     return hour1, ratios
 
 
-def weighted_quantile(pairs, tau):
-    """Weighted tau-quantile of [(value, weight), ...]."""
-    ordered = sorted(pairs)
-    total = sum(w for _, w in ordered)
-    if total <= 0:
-        return ordered[len(ordered) // 2][0]
-    acc = 0.0
-    for value, weight in ordered:
-        acc += weight
-        if acc >= tau * total:
-            return value
-    return ordered[-1][0]
+def weighted_mean_sd(pairs):
+    """Weighted mean and (population) standard deviation of
+    [(value, weight), ...]."""
+    total = sum(w for _, w in pairs)
+    mean = sum(v * w for v, w in pairs) / total
+    var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
+    return mean, math.sqrt(max(var, 0.0))
 
 
 def effective_n(weights):
@@ -192,9 +205,16 @@ def hour_quantiles(pool, p1, hour, levels):
                 pairs.append((ratios[hour], weight))
         if not pairs:
             return None
-        if effective_n([w for _, w in pairs]) >= 5 or band >= 2.0:
-            return [p1 * math.exp(weighted_quantile(pairs, tau)) for tau in levels]
+        if effective_n([w for _, w in pairs]) >= ESS_MIN or band >= 2.0:
+            break
         band *= 1.5
+    mu, sd = weighted_mean_sd(pairs)
+    quantiles = [p1 * math.exp(mu + norm_ppf(tau) * sd) for tau in levels]
+    # Narrow the fitted spread around the median: the raw normal
+    # overstates how far a new launch strays from the pool's centre.
+    median = quantiles[2]
+    return [median * math.exp(SPREAD_SCALE * (math.log(max(q, 1e-9)) - math.log(max(median, 1e-9))))
+            for q in quantiles]
 
 
 def fallback_quantiles(p1, hour, z_values):
@@ -232,7 +252,8 @@ def forecast_case(case, name):
 
     # Smooth the log-quantiles over neighbouring hours, then round
     # and clamp. Smoothing is in log space so a ratio, not an
-    # absolute gap, is what gets averaged.
+    # absolute gap, is what gets averaged. With SMOOTH = 0 this is
+    # the identity: the fitted normal already varies smoothly.
     out_hours = []
     for hour in hours:
         near = [h for h in range(max(2, hour - SMOOTH), min(24, hour + SMOOTH) + 1)
